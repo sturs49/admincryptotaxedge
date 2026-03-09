@@ -1,7 +1,0 @@
-name = "cte-admin"
-main = "src/index.js"
-compatibility_date = "2024-01-01"
-
-[vars]
-# SERVICE_ROLE_KEY is set as a secret via: wrangler secret put SERVICE_ROLE_KEY
-# Or in Cloudflare Dashboard → Worker → Settings → Variables & Secrets
