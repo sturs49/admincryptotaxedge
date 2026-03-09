@@ -1045,56 +1045,24 @@ async function submitAddUser() {
 
   if (!email) { errEl.textContent = 'Email is required.'; return; }
 
-  // Use hardcoded key, then inline input
-  let srk = SERVICE_ROLE_KEY || srkInput?.value.trim() || '';
-
-  if (!srk) {
-    srkField.style.display = 'block';
-    srkInput.focus();
-    errEl.textContent = 'Enter your Supabase service role key above to create users.';
-    return;
-  }
-
-  // Init admin client
-  window.sbAdmin = createClient(SUPABASE_URL, srk, { auth: { autoRefreshToken: false, persistSession: false } });
-  if (srkField) srkField.style.display = 'none';
-
   btn.disabled = true; btn.textContent = 'Creating…';
   errEl.textContent = '';
 
   try {
-    // Use direct REST API with service role key — most reliable, bypasses SDK quirks
+    // Use Worker proxy — service role key stays server-side, never exposed to browser
     let response, body;
 
     if (pass) {
-      // Create user with password
-      response = await fetch(\`\${SUPABASE_URL}/auth/v1/admin/users\`, {
+      response = await fetch('/proxy/create-user', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': srk,
-          'Authorization': \`Bearer \${srk}\`
-        },
-        body: JSON.stringify({
-          email,
-          password: pass,
-          user_metadata: { tier },
-          email_confirm: true
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: pass, user_metadata: { tier }, email_confirm: true })
       });
     } else {
-      // Send invite email (OTP)
-      response = await fetch(\`\${SUPABASE_URL}/auth/v1/invite\`, {
+      response = await fetch('/proxy/invite-user', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': srk,
-          'Authorization': \`Bearer \${srk}\`
-        },
-        body: JSON.stringify({
-          email,
-          data: { tier }
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, data: { tier } })
       });
     }
 
@@ -1134,25 +1102,25 @@ async function grantSelfAdmin() {
       }
     }
 
-    // Try 2: Use service role client to update by email (requires service role key)
-    const adminCli = window.sbAdmin;
-    if (adminCli) {
-      // Find user by email then update metadata
-      const { data: listData, error: listErr } = await adminCli.auth.admin.listUsers();
-      if (!listErr && listData?.users) {
-        const target = listData.users.find(u => u.email === ADMIN_EMAIL);
-        if (target) {
-          const { error: adminUpdateErr } = await adminCli.auth.admin.updateUserById(target.id, {
-            user_metadata: { ...target.user_metadata, tier: 'admin' }
-          });
-          if (!adminUpdateErr) {
-            toast('✓ Admin tier set via service role!');
-            if (btn) { btn.disabled = false; btn.textContent = origText; }
-            return;
-          }
+    // Try 2: Use Worker proxy to update via service role (server-side)
+    try {
+      const listRes = await fetch('/proxy/list-users');
+      const listData = await listRes.json();
+      const target = (listData.users || []).find(u => u.email === ADMIN_EMAIL);
+      if (target) {
+        const updateRes = await fetch(\`/proxy/update-user/\${target.id}\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_metadata: { ...target.user_metadata, tier: 'admin' } })
+        });
+        const updateData = await updateRes.json();
+        if (updateRes.ok) {
+          toast('✓ Admin tier set via Worker proxy!');
+          if (btn) { btn.disabled = false; btn.textContent = origText; }
+          return;
         }
       }
-    }
+    } catch(proxyErr) { /* fall through */ }
 
     // Try 3: profiles table upsert (if you have a profiles table)
     const { data: { user: u2 } } = await sb.auth.getUser();
@@ -1255,12 +1223,78 @@ function timeAgo(iso) {
 </html>
 `;
 
+const SUPABASE_URL_SERVER = 'https://dnhsufwdyhkwrsdtfgyx.supabase.co';
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
 export default {
   async fetch(request, env) {
-    const served = INDEX_HTML.replace(
-      "'{{SERVICE_ROLE_KEY}}'",
-      `'${env.SERVICE_ROLE_KEY || ''}'`
-    );
+    const url = new URL(request.url);
+
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: CORS });
+    }
+
+    // Proxy: create user
+    if (url.pathname === '/proxy/create-user' && request.method === 'POST') {
+      const srk = env.SERVICE_ROLE_KEY;
+      if (!srk) return new Response(JSON.stringify({ error: 'SERVICE_ROLE_KEY not configured' }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      const body = await request.json();
+      const supaRes = await fetch(`${SUPABASE_URL_SERVER}/auth/v1/admin/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': srk, 'Authorization': `Bearer ${srk}` },
+        body: JSON.stringify(body)
+      });
+      const data = await supaRes.json();
+      return new Response(JSON.stringify(data), { status: supaRes.status, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // Proxy: invite user
+    if (url.pathname === '/proxy/invite-user' && request.method === 'POST') {
+      const srk = env.SERVICE_ROLE_KEY;
+      if (!srk) return new Response(JSON.stringify({ error: 'SERVICE_ROLE_KEY not configured' }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      const body = await request.json();
+      const supaRes = await fetch(`${SUPABASE_URL_SERVER}/auth/v1/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': srk, 'Authorization': `Bearer ${srk}` },
+        body: JSON.stringify(body)
+      });
+      const data = await supaRes.json();
+      return new Response(JSON.stringify(data), { status: supaRes.status, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // Proxy: update user by id (for re-grant admin)
+    if (url.pathname.startsWith('/proxy/update-user/') && request.method === 'POST') {
+      const srk = env.SERVICE_ROLE_KEY;
+      if (!srk) return new Response(JSON.stringify({ error: 'SERVICE_ROLE_KEY not configured' }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      const userId = url.pathname.replace('/proxy/update-user/', '');
+      const body = await request.json();
+      const supaRes = await fetch(`${SUPABASE_URL_SERVER}/auth/v1/admin/users/${userId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'apikey': srk, 'Authorization': `Bearer ${srk}` },
+        body: JSON.stringify(body)
+      });
+      const data = await supaRes.json();
+      return new Response(JSON.stringify(data), { status: supaRes.status, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // Proxy: list users (for re-grant admin lookup)
+    if (url.pathname === '/proxy/list-users' && request.method === 'GET') {
+      const srk = env.SERVICE_ROLE_KEY;
+      if (!srk) return new Response(JSON.stringify({ error: 'SERVICE_ROLE_KEY not configured' }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      const supaRes = await fetch(`${SUPABASE_URL_SERVER}/auth/v1/admin/users?per_page=1000`, {
+        headers: { 'apikey': srk, 'Authorization': `Bearer ${srk}` }
+      });
+      const data = await supaRes.json();
+      return new Response(JSON.stringify(data), { status: supaRes.status, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // Serve HTML (no longer injecting the key into the page)
+    const served = INDEX_HTML.replace("'{{SERVICE_ROLE_KEY}}'", "''");
     return new Response(served, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
