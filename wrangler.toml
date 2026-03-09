@@ -1,2 +1,5 @@
-name = "cte-admin"
+name = "bitter-mud-8e4a"
 compatibility_date = "2024-01-01"
+
+[assets]
+directory = "."
